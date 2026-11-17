@@ -79,8 +79,10 @@ export class ManagedVideo {
 
   private async attach(bps: number): Promise<void> {
     this.state = 'attaching';
-    const native = this.el.canPlayType('application/vnd.apple.mpegurl') !== '';
-    if (!native) await loadHls(this.hlsUrl);
+    // hls.js — завжди, коли є MSE: інакше в Chrome ≥ 142 (вбудований HLS) метод втратив би
+    // керування рівнем і зупинкою завантаження, а Б при цьому йшла б через hls.js.
+    // Вбудований HLS лишається запасним варіантом для браузерів без MSE (Safari на iPhone).
+    await loadHls(this.hlsUrl);
     const levels = this.entry.levels;
     const bits = bps * 8 * 0.7; // запас 30%
     let start = 0;
@@ -99,7 +101,7 @@ export class ManagedVideo {
       this.hls.loadSource(url);
       this.hls.attachMedia(this.el);
     } else if (this.el.canPlayType('application/vnd.apple.mpegurl')) {
-      this.el.src = url; // Safari — нативний HLS
+      this.el.src = url; // браузер без MSE — вбудований HLS
     } else {
       this.el.src = this.base + this.entry.mp4;
     }

@@ -86,10 +86,12 @@ async function synthImage(i) {
 async function processImage(input, id) {
   const dir = path.join(OUT, 'img', id);
   await fs.mkdir(dir, { recursive: true });
-  const img = sharp(input).rotate();
-  const meta = await img.metadata();
-  const w = meta.autoOrient?.width ?? meta.width;
-  const h = meta.autoOrient?.height ?? meta.height;
+  // metadata() повертає розміри до EXIF-повороту (autoOrient є лише в sharp ≥ 0.34),
+  // тож для орієнтацій 5–8 (поворот на 90°) ширину й висоту міняємо місцями.
+  const meta = await sharp(input).metadata();
+  const swap = (meta.orientation ?? 1) >= 5;
+  const w = meta.autoOrient?.width ?? (swap ? meta.height : meta.width);
+  const h = meta.autoOrient?.height ?? (swap ? meta.width : meta.height);
 
   const variants = { avif: {}, webp: {}, jpeg: {} };
   const widths = M.widths.filter((x) => x <= w);
