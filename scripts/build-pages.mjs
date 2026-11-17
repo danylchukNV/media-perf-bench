@@ -4,9 +4,10 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import config from '../bench.config.mjs';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = path.join(ROOT, 'public', 'pages');
 const manifest = JSON.parse(await fs.readFile(path.join(ROOT, 'public', 'media', 'manifest.json'), 'utf8'));
 const useCV = process.argv.includes('--cv');

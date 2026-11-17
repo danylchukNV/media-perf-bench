@@ -13,6 +13,7 @@
 import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -21,7 +22,7 @@ import sharp from 'sharp';
 import config from '../bench.config.mjs';
 
 const run = promisify(execFile);
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SRC_IMG = path.join(ROOT, 'media-source', 'images');
 const SRC_VID = path.join(ROOT, 'media-source', 'videos');
 const OUT = path.join(ROOT, 'public', 'media');

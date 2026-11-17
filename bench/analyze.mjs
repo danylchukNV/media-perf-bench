@@ -7,8 +7,9 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RES = path.join(ROOT, 'results');
 const ci = process.argv.indexOf('--compare');
 const [BASE, TEST] = ci > 0 ? process.argv[ci + 1].split(',') : ['b', 'c'];
