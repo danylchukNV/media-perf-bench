@@ -1,0 +1,28 @@
+{
+  "name": "media-perf-bench",
+  "version": "1.0.0",
+  "description": "Тестовий стенд для експериментального дослідження методу АКПМ (адаптивна контекстно-залежна пріоритизація завантаження медіаресурсів)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "media": "node scripts/generate-media.mjs",
+    "build:lib": "esbuild src/akpm/index.ts --bundle --format=iife --global-name=AKPM --target=es2020 --minify --sourcemap --outfile=public/akpm.js",
+    "build:pages": "node scripts/build-pages.mjs",
+    "build": "npm run build:lib && npm run build:pages",
+    "typecheck": "tsc --noEmit",
+    "serve": "node server.mjs",
+    "bench": "node bench/run.mjs",
+    "analyze": "node bench/analyze.mjs",
+    "lhci": "npx --yes @lhci/cli autorun"
+  },
+  "dependencies": {
+    "hls.js": "^1.5.0",
+    "puppeteer": "^23.0.0",
+    "sharp": "^0.33.0",
+    "web-vitals": "^4.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}
