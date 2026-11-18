@@ -138,13 +138,29 @@ async function synthVideo(i, file) {
   ]);
 }
 
+async function probeVideo(input) {
+  const { stdout } = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0',
+    '-show_entries', 'stream=width,height:stream_side_data=rotation', '-of', 'json', input]);
+  const s = JSON.parse(stdout).streams?.[0] ?? {};
+  const rot = Math.abs(Number(s.side_data_list?.find((d) => 'rotation' in d)?.rotation ?? 0));
+  return rot === 90 || rot === 270 ? { w: s.height, h: s.width } : { w: s.width, h: s.height };
+}
+
 async function processVideo(input, id) {
   const dir = path.join(OUT, 'video', id);
   await fs.mkdir(dir, { recursive: true });
   const seg = String(M.hlsSegmentSeconds);
-  const gop = String(M.hlsSegmentSeconds * 30);
+  // Ключові кадри за часом, а не за кількістю кадрів: сегменти однакові за будь-якої частоти кадрів
+  const keyframes = ['-force_key_frames', `expr:gte(t,n_forced*${seg})`, '-sc_threshold', '0'];
+  // Рівні вище за роздільність джерела не створюємо: розтягнуте відео дає зайві байти без якості
+  const src = await probeVideo(input);
+  const ladder = M.videoLevels.filter((L) => L.height <= src.h);
+  if (ladder.length === 0) ladder.push(M.videoLevels[0]);
+  if (ladder.length < M.videoLevels.length) {
+    console.warn(`  ${id}: джерело ${src.w}×${src.h}, рівні вище ${ladder.at(-1).height}p пропущено`);
+  }
   const levels = [];
-  for (const L of M.videoLevels) {
+  for (const L of ladder) {
     const ldir = path.join(dir, `${L.height}p`);
     await fs.mkdir(ldir, { recursive: true });
     await ffmpeg([
@@ -152,12 +168,12 @@ async function processVideo(input, id) {
       '-vf', `scale=-2:${L.height}`,
       '-c:v', 'libx264', '-preset', 'veryfast', '-profile:v', 'main',
       '-b:v', `${L.bitrate}k`, '-maxrate', `${Math.round(L.bitrate * 1.1)}k`, '-bufsize', `${L.bitrate * 2}k`,
-      '-g', gop, '-keyint_min', gop, '-sc_threshold', '0', '-pix_fmt', 'yuv420p',
+      ...keyframes, '-pix_fmt', 'yuv420p',
       '-hls_time', seg, '-hls_playlist_type', 'vod',
       '-hls_segment_filename', path.join(ldir, 'seg_%03d.ts'),
       path.join(ldir, 'index.m3u8'),
     ]);
-    const width = Math.round((L.height * 16) / 9 / 2) * 2;
+    const width = Math.round((L.height * src.w) / src.h / 2) * 2;
     levels.push({ height: L.height, width, bitrate: L.bitrate * 1000, uri: `${L.height}p/index.m3u8` });
   }
   const master = ['#EXTM3U', '#EXT-X-VERSION:3'];
@@ -167,7 +183,7 @@ async function processVideo(input, id) {
   }
   await fs.writeFile(path.join(dir, 'master.m3u8'), master.join('\n') + '\n');
   // Повне mp4 (для конфігурації А) — найвищий рівень
-  const top = M.videoLevels[M.videoLevels.length - 1];
+  const top = ladder[ladder.length - 1];
   await ffmpeg(['-i', input, '-an', '-vf', `scale=-2:${top.height}`, '-c:v', 'libx264', '-preset', 'veryfast',
     '-b:v', `${top.bitrate}k`, '-maxrate', `${Math.round(top.bitrate * 1.1)}k`, '-bufsize', `${top.bitrate * 2}k`,
     '-pix_fmt', 'yuv420p', '-movflags', '+faststart', path.join(dir, 'full.mp4')]);
@@ -178,7 +194,7 @@ async function processVideo(input, id) {
   await fs.rm(posterPng);
   const fullStat = await fs.stat(path.join(dir, 'full.mp4'));
   return {
-    w: 1920, h: 1080,
+    w: levels.at(-1).width, h: top.height,
     master: `/media/video/${id}/master.m3u8`,
     mp4: `/media/video/${id}/full.mp4`,
     poster: `/media/video/${id}/poster.jpg`,

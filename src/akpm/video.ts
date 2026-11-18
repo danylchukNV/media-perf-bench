@@ -9,7 +9,10 @@ interface HlsInstance {
   startLoad(pos?: number): void;
   stopLoad(): void;
   destroy(): void;
+  on(event: string, cb: () => void): void;
+  autoLevelCapping: number;
 }
+const MANIFEST_PARSED = 'hlsManifestParsed'; // Hls.Events.MANIFEST_PARSED
 interface HlsCtor {
   new (cfg: Record<string, unknown>): HlsInstance;
   isSupported(): boolean;
@@ -70,6 +73,9 @@ export class ManagedVideo {
     else if (near && this.state === 'stopped') { this.hls?.startLoad(-1); this.state = 'loading'; }
     else if (!near && this.state === 'loading' && p.dist > 2 * vh) { this.hls?.stopLoad(); this.state = 'stopped'; }
 
+    // Розмір плеєра може змінитися (поворот екрана, зміна ширини вікна)
+    if (this.hls) this.applyCap(this.sizeCap());
+
     if (p.visibleRatio >= 0.5) {
       if (this.el.paused && (this.state === 'loading' || this.state === 'stopped')) this.el.play().catch(() => {});
     } else if (!this.el.paused) {
@@ -87,6 +93,9 @@ export class ManagedVideo {
     const bits = bps * 8 * 0.7; // запас 30%
     let start = 0;
     levels.forEach((l, i) => { if (l.bitrate <= bits) start = i; });
+    // Не вище за розмір плеєра (як для зображень)
+    const cap = this.sizeCap();
+    if (cap >= 0) start = Math.min(start, cap);
     const Hls = getHls();
     const url = this.base + this.entry.master;
     if (Hls && Hls.isSupported()) {
@@ -98,6 +107,10 @@ export class ManagedVideo {
         abrEwmaDefaultEstimate: Math.max(200_000, bps * 8),
         testBandwidth: false,
       });
+      // Стелю задаємо самі: власне capLevelToPlayerSize у hls.js покладається на ResizeObserver
+      // і не завжди отримує розмір плеєра, тоді ABR піднімає рівень до 1080p у малий плеєр.
+      // Розбір маніфесту скидає стелю, тому ставимо її саме після нього.
+      this.hls.on(MANIFEST_PARSED, () => this.applyCap(this.sizeCap()));
       this.hls.loadSource(url);
       this.hls.attachMedia(this.el);
     } else if (this.el.canPlayType('application/vnd.apple.mpegurl')) {
@@ -106,5 +119,19 @@ export class ManagedVideo {
       this.el.src = this.base + this.entry.mp4;
     }
     this.state = 'loading';
+  }
+
+  /** Індекс найменшого рівня, що покриває фізичну ширину плеєра; −1, якщо розмір невідомий */
+  private sizeCap(): number {
+    const physW = this.el.clientWidth * (window.devicePixelRatio || 1);
+    if (!(physW > 0)) return -1;
+    const levels = this.entry.levels;
+    const i = levels.findIndex((l) => l.width >= physW);
+    return i < 0 ? levels.length - 1 : i;
+  }
+
+  private applyCap(cap: number): void {
+    if (!this.hls || cap < 0 || this.hls.autoLevelCapping === cap) return;
+    this.hls.autoLevelCapping = cap;
   }
 }

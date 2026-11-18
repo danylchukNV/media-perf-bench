@@ -5,7 +5,7 @@ export default {
   media: {
     imageCount: 60,          // скільки зображень у стрічці (якщо немає власних у media-source/images)
     videoCount: 4,           // скільки відео (якщо немає власних у media-source/videos)
-    videoEvery: 12,          // відео-картка після кожних N зображень
+    videoEvery: 10,          // відео-картка після кожних N зображень (63 у стрічці / 10 → 6 відео)
     sourceWidth: 2400,       // ширина синтетичного «оригіналу»
     sourceHeight: 1600,
     widths: [320, 480, 640, 960, 1280, 1920],
