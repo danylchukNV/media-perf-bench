@@ -44,6 +44,7 @@ export class ManagedVideo {
   geom: Geometry = { top: 0, bottom: 0, height: 0 };
   state: VideoState = 'idle';
   private hls?: HlsInstance;
+  private manifestReady = false;
   private posterSet = false;
 
   constructor(
@@ -71,7 +72,12 @@ export class ManagedVideo {
     const near = p.visible || p.tauMs < 2500 || p.dist < 0.5 * vh;
     if (near && this.state === 'idle') void this.attach(bps);
     else if (near && this.state === 'stopped') { this.hls?.startLoad(-1); this.state = 'loading'; }
-    else if (!near && this.state === 'loading' && p.dist > 2 * vh) { this.hls?.stopLoad(); this.state = 'stopped'; }
+    // Поки маніфест не розібрано, не зупиняємо: stopLoad() у hls.js скасовує запит маніфесту,
+    // а startLoad() його вже не повторює — відео лишалося б без джерела назавжди.
+    else if (!near && this.state === 'loading' && p.dist > 2 * vh && (this.manifestReady || !this.hls)) {
+      this.hls?.stopLoad();
+      this.state = 'stopped';
+    }
 
     // Розмір плеєра може змінитися (поворот екрана, зміна ширини вікна)
     if (this.hls) this.applyCap(this.sizeCap());
@@ -110,7 +116,7 @@ export class ManagedVideo {
       // Стелю задаємо самі: власне capLevelToPlayerSize у hls.js покладається на ResizeObserver
       // і не завжди отримує розмір плеєра, тоді ABR піднімає рівень до 1080p у малий плеєр.
       // Розбір маніфесту скидає стелю, тому ставимо її саме після нього.
-      this.hls.on(MANIFEST_PARSED, () => this.applyCap(this.sizeCap()));
+      this.hls.on(MANIFEST_PARSED, () => { this.manifestReady = true; this.applyCap(this.sizeCap()); });
       this.hls.loadSource(url);
       this.hls.attachMedia(this.el);
     } else if (this.el.canPlayType('application/vnd.apple.mpegurl')) {

@@ -27,11 +27,12 @@ const runs = Number(arg('runs', B.runs));
 const configs = list(arg('configs'), B.configs);
 const networks = list(arg('networks'), Object.keys(B.networks));
 const devices = list(arg('devices'), Object.keys(B.devices));
-const outDir = path.join(ROOT, arg('out', 'results'));
+const outDir = path.resolve(ROOT, arg('out', 'results'));
 const sc = B.scenario;
 const maxLoadWaitMs = Number(arg('max-load-wait', 20000));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const MAX_STEP_PX = 200; // ≈ 4 номінальні кроки по 50 мс при 900 пікс./с
 
 // Детерміноване перемішування порядку конфігурацій у кожному раунді (зменшує систематичний зсув)
 function shuffled(arr, seed) {
@@ -46,9 +47,18 @@ function shuffled(arr, seed) {
 }
 
 async function measure(browser, baseUrl, cfg, netName, devName) {
+  const ctx = await browser.createBrowserContext();
+  // Контекст закривається і при помилці: інакше сторінка вантажила б медіа далі й заважала наступному прогону
+  try {
+    return await measureIn(ctx, baseUrl, cfg, netName, devName);
+  } finally {
+    await ctx.close().catch(() => {});
+  }
+}
+
+async function measureIn(ctx, baseUrl, cfg, netName, devName) {
   const net = B.networks[netName];
   const dev = B.devices[devName];
-  const ctx = await browser.createBrowserContext();
   const page = await ctx.newPage();
   const cdp = await page.createCDPSession();
 
@@ -96,7 +106,9 @@ async function measure(browser, baseUrl, cfg, netName, devName) {
   while (scrolled < sc.scrollDistancePx) {
     await sleep(50);
     const now = Date.now();
-    const dy = Math.max(1, Math.round((sc.scrollSpeedPxPerSec * (now - last)) / 1000));
+    // Крок обмежено: якщо ітерація зависла (сторінка зайнята), прокручування сповільнюється,
+    // а не перестрибує через контент — інакше відео могло б не потрапити у вікно взагалі
+    const dy = Math.min(MAX_STEP_PX, Math.max(1, Math.round((sc.scrollSpeedPxPerSec * (now - last)) / 1000)));
     last = now;
     await page.mouse.wheel({ deltaY: dy });
     scrolled += dy;
@@ -139,7 +151,6 @@ async function measure(browser, baseUrl, cfg, netName, devName) {
   const m = await page.evaluate(() => window.__benchCollect());
   let bytes = 0;
   for (const r of reqs.values()) bytes += r.final ?? r.partial;
-  await ctx.close();
   return {
     ...m,
     bytes,
@@ -160,13 +171,30 @@ async function main() {
 
   const args = ['--autoplay-policy=no-user-gesture-required'];
   if (process.platform === 'linux' && process.getuid?.() === 0) args.push('--no-sandbox');
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    args,
-  });
-  console.log(`Chrome ${await browser.version()} · ${runs} прогонів × ${configs.length} конф. × ${networks.length} мереж × ${devices.length} пристр.`);
+  // Chrome може впасти посеред серії (траплялося на Windows). Тоді браузер перезапускається,
+  // а невдалий прогін повторюється один раз; інакше всі наступні прогони падали б із «Connection closed».
+  let browser = null;
+  let crashes = 0;
+  const launch = async () => {
+    const b = await puppeteer.launch({
+      headless: true,
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args,
+    });
+    b.on('disconnected', () => { if (b === browser) { crashes++; console.error(`  ! Chrome від'єднався (${new Date().toLocaleTimeString()}), буде перезапущено`); } });
+    return b;
+  };
+  // На Windows видалення тимчасового профілю іноді дає EBUSY — це не має зупиняти серію
+  // Після «від'єднання» процес Chrome може лишатися живим і не давати Node завершитися, тому його вбиваємо явно
+  const safeClose = async (b) => {
+    try { await b?.close(); } catch {}
+    try { b?.process()?.kill('SIGKILL'); } catch {}
+  };
+  browser = await launch();
+  const chromeVersion = await browser.version();
+  console.log(`Chrome ${chromeVersion} · ${runs} прогонів × ${configs.length} конф. × ${networks.length} мереж × ${devices.length} пристр.`);
 
+  const MAX_ATTEMPTS = 2;
   const total = runs * configs.length * networks.length * devices.length;
   let n = 0;
   for (let run = 1; run <= runs; run++) {
@@ -174,23 +202,41 @@ async function main() {
       for (const devName of devices) {
         for (const cfg of shuffled(configs, run * 31 + netName.length * 7 + devName.length)) {
           n++;
-          const t = Date.now();
-          try {
-            const m = await measure(browser, baseUrl, cfg, netName, devName);
-            const row = { config: cfg, network: netName, device: devName, run, ...m, chrome: await browser.version() };
-            await fs.appendFile(jsonl, JSON.stringify(row) + '\n');
-            console.log(`[${n}/${total}] ${cfg} ${netName} ${devName} #${run}: LCP ${Math.round(m.lcp ?? -1)} мс, CLS ${(m.cls ?? 0).toFixed(3)}, INP ${m.inp ?? '-'} мс, ${(m.bytes / 1e6).toFixed(2)} МБ (${((Date.now() - t) / 1000).toFixed(0)} с)`);
-          } catch (e) {
-            console.error(`[${n}/${total}] ${cfg} ${netName} ${devName} #${run}: ПОМИЛКА ${e.message}`);
-            await fs.appendFile(jsonl, JSON.stringify({ config: cfg, network: netName, device: devName, run, error: e.message }) + '\n');
+          const tag = `[${n}/${total}] ${cfg} ${netName} ${devName} #${run}`;
+          for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            if (!browser.connected) {
+              const dead = browser;
+              browser = null; // щоб 'disconnected' старого екземпляра не рахувався двічі
+              await safeClose(dead);
+              browser = await launch();
+            }
+            const t = Date.now();
+            try {
+              const m = await measure(browser, baseUrl, cfg, netName, devName);
+              const row = { config: cfg, network: netName, device: devName, run, attempt, ...m, chrome: chromeVersion };
+              await fs.appendFile(jsonl, JSON.stringify(row) + '\n');
+              console.log(`${tag}: LCP ${Math.round(m.lcp ?? -1)} мс, CLS ${(m.cls ?? 0).toFixed(3)}, INP ${m.inp ?? '-'} мс, ${(m.bytes / 1e6).toFixed(2)} МБ (${((Date.now() - t) / 1000).toFixed(0)} с)${attempt > 1 ? ' — повторна спроба' : ''}`);
+              break;
+            } catch (e) {
+              if (attempt < MAX_ATTEMPTS) {
+                console.error(`${tag}: ПОМИЛКА ${e.message} — повторюю`);
+              } else {
+                console.error(`${tag}: ПОМИЛКА ${e.message}`);
+                await fs.appendFile(jsonl, JSON.stringify({ config: cfg, network: netName, device: devName, run, attempt, error: e.message }) + '\n');
+              }
+            }
           }
         }
       }
     }
   }
-  await browser.close();
+  const last = browser;
+  browser = null;
+  await safeClose(last);
   server.close();
+  if (crashes) console.log(`\nПерезапусків Chrome за серію: ${crashes}`);
   console.log(`\nСирі дані: ${path.relative(ROOT, jsonl)}\nДалі: npm run analyze`);
+  process.exit(0); // не чекати на завислі дочірні процеси
 }
 
 main().catch((e) => { console.error(e); process.exit(1); });

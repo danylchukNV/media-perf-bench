@@ -25,7 +25,7 @@ export default {
 
   // ---------- Бенчмарк ----------
   bench: {
-    configs: ['a', 'b', 'c'],
+    configs: ['a', 'b', 'b2', 'c'],  // b2 = Б′: Б + capLevelToPlayerSize для hls.js
     runs: 20,                       // прогонів на кожну комбінацію
     // Мережеві профілі. Slow 4G = профіль Lighthouse mobileSlow4G (150 мс RTT, 1.6 Мбіт/с).
     networks: {

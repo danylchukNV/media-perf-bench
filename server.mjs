@@ -21,7 +21,7 @@ const MIME = {
 };
 
 const ALIASES = {
-  '/': 'pages/index.html', '/a': 'pages/a.html', '/b': 'pages/b.html', '/c': 'pages/c.html',
+  '/': 'pages/index.html', '/a': 'pages/a.html', '/b': 'pages/b.html', '/b2': 'pages/b2.html', '/c': 'pages/c.html',
   '/vendor/hls.min.js': '../node_modules/hls.js/dist/hls.min.js',
   '/vendor/web-vitals.iife.js': '../node_modules/web-vitals/dist/web-vitals.iife.js',
 };
@@ -58,5 +58,5 @@ export function createServer() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.join(ROOT, 'server.mjs')) {
-  createServer().listen(port, () => console.log(`Стенд: http://localhost:${port}  (A: /a, B: /b, C: /c)${allowCache ? '' : '  [no-store]'}`));
+  createServer().listen(port, () => console.log(`Стенд: http://localhost:${port}  (A: /a, B: /b, B′: /b2, C: /c)${allowCache ? '' : '  [no-store]'}`));
 }

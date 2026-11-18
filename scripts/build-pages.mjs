@@ -57,7 +57,9 @@ const picture = (id, sizes, extra) => {
     </picture>`;
 };
 
-const B = {
+// Б і Б′ відрізняються лише налаштуваннями hls.js: Б — за замовчуванням,
+// Б′ — з capLevelToPlayerSize (рівень не вище за розмір плеєра), тобто суворіша базова лінія.
+const makeB = (hlsConfig = {}) => ({
   hero: (id) => picture(id, HERO_SIZES, 'class="hero-img" elementtiming="hero" fetchpriority="high" decoding="async"'),
   img: (id) => picture(id, CARD_SIZES, 'loading="lazy" decoding="async"'),
   video: (id) => {
@@ -70,7 +72,7 @@ const B = {
 // Стандартна практика: hls.js з defer, HLS (ABR hls.js за замовчуванням) підключається і відтворюється,
 // коли відео видно на 50%
 function attach(v) {
-  if (window.Hls && Hls.isSupported()) { const h = new Hls(); h.loadSource(v.dataset.src); h.attachMedia(v); }
+  if (window.Hls && Hls.isSupported()) { const h = new Hls(${JSON.stringify(hlsConfig)}); h.loadSource(v.dataset.src); h.attachMedia(v); }
   else if (v.canPlayType('application/vnd.apple.mpegurl')) v.src = v.dataset.src;
   else return false;
   return true;
@@ -90,7 +92,9 @@ window.addEventListener('DOMContentLoaded', () => document.querySelectorAll('vid
   if (v._want && !v._attached) { v._attached = attach(v); if (v._attached) v.play().catch(() => {}); }
 }));
 </script>`,
-};
+});
+const B = makeB();
+const B2 = makeB({ capLevelToPlayerSize: true });
 
 const C = {
   hero: (id) => picture(id, HERO_SIZES, 'class="hero-img" elementtiming="hero" data-akpm-hero fetchpriority="high" decoding="async"'),
@@ -202,8 +206,9 @@ ${tail}
 await fs.mkdir(OUT, { recursive: true });
 await fs.writeFile(path.join(OUT, 'a.html'), page('a', 'A — базова', A));
 await fs.writeFile(path.join(OUT, 'b.html'), page('b', 'B — стандартні практики', B));
+await fs.writeFile(path.join(OUT, 'b2.html'), page('b2', 'B′ — стандартні практики + обмеження відео за розміром плеєра', B2));
 await fs.writeFile(path.join(OUT, 'c.html'), page('c', 'C — метод АКПМ', C));
 await fs.writeFile(path.join(OUT, 'index.html'), `<!doctype html><meta charset="utf-8"><title>Стенд</title>
 <h1>Тестовий стенд</h1><ul>
-<li><a href="/a">A — базова</a></li><li><a href="/b">B — стандартні практики</a></li><li><a href="/c">C — метод АКПМ</a></li></ul>`);
+<li><a href="/a">A — базова</a></li><li><a href="/b">B — стандартні практики</a></li><li><a href="/b2">B′ — стандартні практики + обмеження відео за розміром плеєра</a></li><li><a href="/c">C — метод АКПМ</a></li></ul>`);
 console.log(`Сторінки згенеровано: ${feedIds.length + 1} зображень, ${Math.min(vidIds.length, Math.floor(feedIds.length / config.media.videoEvery))} відео${useCV ? ', content-visibility увімкнено' : ''}`);

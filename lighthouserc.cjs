@@ -3,7 +3,7 @@
 module.exports = {
   ci: {
     collect: {
-      url: ['http://localhost:8080/a', 'http://localhost:8080/b', 'http://localhost:8080/c'],
+      url: ['http://localhost:8080/a', 'http://localhost:8080/b', 'http://localhost:8080/b2', 'http://localhost:8080/c'],
       numberOfRuns: 3,
       settings: {
         formFactor: 'mobile',

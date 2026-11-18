@@ -3,7 +3,8 @@
 //
 //   node bench/analyze.mjs                       # останній results/raw-*.jsonl
 //   node bench/analyze.mjs results/raw-a.jsonl results/raw-b.jsonl   # об'єднати кілька файлів
-//   node bench/analyze.mjs --compare b,c         # які конфігурації порівнювати статистично
+//   node bench/analyze.mjs --compare b,b2,c      # останній — що перевіряємо, решта — з чим порівнюємо
+//                                                # (за замовчуванням В відносно Б і Б′, які є в даних)
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -12,7 +13,9 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const RES = path.join(ROOT, 'results');
 const ci = process.argv.indexOf('--compare');
-const [BASE, TEST] = ci > 0 ? process.argv[ci + 1].split(',') : ['b', 'c'];
+const compareList = ci > 0 ? process.argv[ci + 1].split(',') : ['b', 'b2', 'c'];
+const TEST = compareList.at(-1);
+const BASES = compareList.slice(0, -1);
 const ALPHA = 0.05;
 
 const METRICS = [
@@ -25,8 +28,13 @@ const METRICS = [
   { key: 'requests', label: 'Кількість запитів', f: (v) => v, d: 0 },
   { key: 'videoTtp', label: 'Час до початку відтворення відео, с', f: (v) => v / 1000, d: 2 },
   { key: 'videoStalls', label: 'Зупинки відтворення відео', f: (v) => v, d: 1 },
+  // Скільки відео почало відтворюватися за сесію: без цього порівняння обсягу даних неповне
+  { key: 'videosPlayed', label: 'Відтворено відео за сесію', f: (v) => v, d: 1 },
 ];
-const CFG_LABEL = { a: 'А (базова)', b: 'Б (стандартні практики)', c: 'В (метод АКПМ)' };
+const CFG_LABEL = { a: 'А (базова)', b: 'Б (стандартні практики)', b2: 'Б′ (Б + обмеження відео за розміром плеєра)', c: 'В (метод АКПМ)' };
+const CFG_SHORT = { a: 'А', b: 'Б', b2: 'Б′', c: 'В' };
+const CFG_ORDER = ['a', 'b', 'b2', 'c'];
+const short = (c) => CFG_SHORT[c] ?? c.toUpperCase();
 
 // ---------- статистика ----------
 function quantile(sorted, q) {
@@ -112,18 +120,20 @@ async function main() {
 
   const md = [`# Результати експерименту\n`,
     `Джерела: ${files.map((f) => path.relative(ROOT, f)).join(', ')}. Успішних прогонів: ${rows.length}${errors ? `, з помилкою: ${errors}` : ''}.`,
-    `Порівняння: ${CFG_LABEL[TEST] ?? TEST} відносно ${CFG_LABEL[BASE] ?? BASE}; U-критерій Манна — Уїтні, двосторонній, α = ${String(ALPHA).replace('.', ',')}.`,
+    `Порівняння: ${CFG_LABEL[TEST] ?? TEST} відносно ${BASES.map((b) => CFG_LABEL[b] ?? b).join(' і ')} (якщо є в даних); U-критерій Манна — Уїтні, двосторонній, α = ${String(ALPHA).replace('.', ',')}.`,
     `Chrome: ${[...new Set(rows.map((r) => r.chrome))].join(', ')}\n`];
   const csv = ['network,device,metric,config,n,median,p75,change_pct_vs_base,mw_U,mw_p'];
 
   for (const [g, byCfg] of [...groups.entries()].sort()) {
     const [net, dev] = g.split('|');
-    const cfgs = ['a', 'b', 'c'].filter((c) => byCfg.has(c)).concat([...byCfg.keys()].filter((c) => !['a', 'b', 'c'].includes(c)));
+    const cfgs = CFG_ORDER.filter((c) => byCfg.has(c)).concat([...byCfg.keys()].filter((c) => !CFG_ORDER.includes(c)));
+    const bases = BASES.filter((b) => byCfg.has(b) && b !== TEST);
     const n = Object.fromEntries(cfgs.map((c) => [c, byCfg.get(c)._n]));
     md.push(`## ${net} · ${dev}\n`);
-    md.push(`Таблиця — Показники продуктивності тестового застосунку (${net}, ${dev}, медіана; у дужках — 75-й процентиль). Прогонів: ${cfgs.map((c) => `${c.toUpperCase()} = ${n[c]}`).join(', ')}.\n`);
-    md.push(`| Показник | ${cfgs.map((c) => CFG_LABEL[c] ?? c).join(' | ')} | Зміна ${TEST.toUpperCase()} відносно ${BASE.toUpperCase()}, % | p |`);
-    md.push(`|${'---|'.repeat(cfgs.length + 3)}`);
+    md.push(`Таблиця — Показники продуктивності тестового застосунку (${net}, ${dev}, медіана; у дужках — 75-й процентиль). Прогонів: ${cfgs.map((c) => `${short(c)} = ${n[c]}`).join(', ')}.\n`);
+    const cmpHead = bases.map((b) => `Зміна ${short(TEST)} відносно ${short(b)}, % | p (${short(b)})`).join(' | ');
+    md.push(`| Показник | ${cfgs.map((c) => CFG_LABEL[c] ?? c).join(' | ')}${bases.length ? ' | ' + cmpHead : ''} |`);
+    md.push(`|${'---|'.repeat(cfgs.length + 1 + bases.length * 2)}`);
     for (const m of METRICS) {
       const cells = [];
       const med = {};
@@ -135,22 +145,27 @@ async function main() {
         csv.push([net, dev, m.key, c, vals.length, med[c] ?? '', p75 ?? ''].join(',') + ',,,');
       }
       if (cells.every((c) => c === '—')) continue;
-      const x = byCfg.get(BASE)?.[m.key] ?? [];
       const y = byCfg.get(TEST)?.[m.key] ?? [];
-      const change = med[BASE] ? ((med[TEST] - med[BASE]) / med[BASE]) * 100 : null;
-      const mw = mannWhitney(x, y);
-      const sig = mw && mw.p < ALPHA ? ' *' : '';
-      md.push(`| ${m.label} | ${cells.join(' | ')} | ${change == null ? '—' : (change > 0 ? '+' : '') + fmt(change, 1)} | ${fmtP(mw?.p)}${sig} |`);
-      csv.push([net, dev, m.key, `${TEST}_vs_${BASE}`, '', '', '', change ?? '', mw?.U ?? '', mw?.p ?? ''].join(','));
+      for (const b of bases) {
+        const x = byCfg.get(b)?.[m.key] ?? [];
+        const change = med[b] && med[TEST] != null ? ((med[TEST] - med[b]) / med[b]) * 100 : null;
+        const mw = mannWhitney(x, y);
+        const sig = mw && mw.p < ALPHA ? ' *' : '';
+        cells.push(change == null ? '—' : (change > 0 ? '+' : '') + fmt(change, 1), `${fmtP(mw?.p)}${sig}`);
+        csv.push([net, dev, m.key, `${TEST}_vs_${b}`, '', '', '', change ?? '', mw?.U ?? '', mw?.p ?? ''].join(','));
+      }
+      md.push(`| ${m.label} | ${cells.join(' | ')} |`);
     }
-    md.push(`| Головне зображення відобразилось за сесію, прогонів | ${cfgs.map((c) => `${byCfg.get(c)._hero} з ${byCfg.get(c)._n}`).join(' | ')} | | |`);
-    md.push(`| LCP-елемент — зображення, прогонів | ${cfgs.map((c) => `${byCfg.get(c)._lcpImg} з ${byCfg.get(c)._n}`).join(' | ')} | | |`);
+    const blank = ' |'.repeat(bases.length * 2);
+    md.push(`| Головне зображення відобразилось за сесію, прогонів | ${cfgs.map((c) => `${byCfg.get(c)._hero} з ${byCfg.get(c)._n}`).join(' | ')} |${blank}`);
+    md.push(`| LCP-елемент — зображення, прогонів | ${cfgs.map((c) => `${byCfg.get(c)._lcpImg} з ${byCfg.get(c)._n}`).join(' | ')} |${blank}`);
     md.push('');
     md.push(`\\* — різниця статистично значуща (p < ${String(ALPHA).replace('.', ',')}).\n`);
   }
 
   md.push(`## Примітки до методики вимірювань\n`,
     `- LCP фіксується до першої взаємодії (прокручування). Якщо головне зображення не встигло відобразитися, LCP-елементом стає текст і LCP виглядає «кращим» — дивіться рядки «Головне зображення відобразилось» і «LCP-елемент».`,
+    `- Якщо в стовпці LCP стоїть «—», Chrome не створив жодного запису LCP до першої взаємодії. Так буває в А на повільній мережі: текст відмальований (є FCP), але, доки великий банер у видимій зоні ще вантажиться, браузер запис LCP не створює, а банер приходить уже після початку прокручування. Для такої конфігурації показовий рядок «Час відображення головного зображення».`,
     `- Час відображення головного зображення — Element Timing API (атрибут elementtiming="hero"); рахується лише в прогонах, де зображення відобразилось.`,
     `- LCP, CLS, INP — бібліотека web-vitals (reportAllChanges); TBT — сума (тривалість − 50 мс) довгих задач після FCP за всю сесію (включно з прокручуванням).`,
     `- Обсяг даних і кількість запитів — за подіями DevTools Protocol, включно зі скасованими запитами; data:/blob: не враховуються.`,
