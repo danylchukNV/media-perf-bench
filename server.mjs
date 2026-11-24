@@ -29,7 +29,11 @@ const ALIASES = {
 export function createServer() {
   return http.createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
-    const rel = ALIASES[url.pathname] ?? decodeURIComponent(url.pathname).replace(/^\/+/, '');
+    let rel = ALIASES[url.pathname] ?? decodeURIComponent(url.pathname).replace(/^\/+/, '');
+    // Сторінки без розширення: /c2, /gallery/c → pages/c2.html, pages/gallery/c.html
+    if (!ALIASES[url.pathname] && /^[a-z0-9-]+(\/[a-z0-9-]+)?$/.test(rel)) rel = `pages/${rel}.html`;
+    // Копії медіа (img-007~1, vid-002~1): той самий файл під окремим URL, щоб не спрацьовував кеш браузера
+    if (rel.startsWith('media/')) rel = rel.replace(/~\d+(?=\/)/g, '');
     const file = path.resolve(PUB, rel);
     if (!file.startsWith(PUB + path.sep) && !file.startsWith(path.join(ROOT, 'node_modules') + path.sep)) { res.writeHead(403).end(); return; }
     fs.stat(file, (err, st) => {
@@ -58,5 +62,5 @@ export function createServer() {
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === path.join(ROOT, 'server.mjs')) {
-  createServer().listen(port, () => console.log(`Стенд: http://localhost:${port}  (A: /a, B: /b, B′: /b2, C: /c)${allowCache ? '' : '  [no-store]'}`));
+  createServer().listen(port, () => console.log(`Стенд: http://localhost:${port}  (A: /a, B: /b, B′: /b2, C: /c, C2: /c2; інші макети: /gallery/c, /infinite/c, /video/c)${allowCache ? '' : '  [no-store]'}`));
 }

@@ -5,6 +5,9 @@
 //   node bench/analyze.mjs results/raw-a.jsonl results/raw-b.jsonl   # об'єднати кілька файлів
 //   node bench/analyze.mjs --compare b,b2,c      # останній — що перевіряємо, решта — з чим порівнюємо
 //                                                # (за замовчуванням В відносно Б і Б′, які є в даних)
+//
+// Крім основних таблиць (формат тези 3), у summary.md додаються розділи розширеного експерименту
+// (bench/extra.mjs): В2 відносно В, абляція, факторний аналіз 2×2, діагностика банера.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -31,58 +34,13 @@ const METRICS = [
   // Скільки відео почало відтворюватися за сесію: без цього порівняння обсягу даних неповне
   { key: 'videosPlayed', label: 'Відтворено відео за сесію', f: (v) => v, d: 1 },
 ];
-const CFG_LABEL = { a: 'А (базова)', b: 'Б (стандартні практики)', b2: 'Б′ (Б + обмеження відео за розміром плеєра)', c: 'В (метод АКПМ)' };
-const CFG_SHORT = { a: 'А', b: 'Б', b2: 'Б′', c: 'В' };
-const CFG_ORDER = ['a', 'b', 'b2', 'c'];
+const CFG_LABEL = { a: 'А (базова)', b: 'Б (стандартні практики)', b2: 'Б′ (Б + обмеження відео за розміром плеєра)', c: 'В (метод АКПМ)', c2: 'В2 (метод АКПМ, версія 2)' };
+const CFG_SHORT = { a: 'А', b: 'Б', b2: 'Б′', c: 'В', c2: 'В2' };
+const CFG_ORDER = ['a', 'b', 'b2', 'c', 'c2'];
 const short = (c) => CFG_SHORT[c] ?? c.toUpperCase();
 
-// ---------- статистика ----------
-function quantile(sorted, q) {
-  if (!sorted.length) return null;
-  const pos = (sorted.length - 1) * q;
-  const lo = Math.floor(pos), hi = Math.ceil(pos);
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
-}
-
-function erf(x) { // Абрамовіц — Стіган 7.1.26
-  const s = Math.sign(x); x = Math.abs(x);
-  const t = 1 / (1 + 0.3275911 * x);
-  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
-  return s * y;
-}
-const normCdf = (z) => 0.5 * (1 + erf(z / Math.SQRT2));
-
-/** Двосторонній U-критерій Манна — Уїтні (нормальне наближення з поправками на зв'язки та неперервність). */
-function mannWhitney(x, y) {
-  const n1 = x.length, n2 = y.length;
-  if (n1 < 3 || n2 < 3) return null;
-  const all = [...x.map((v) => [v, 0]), ...y.map((v) => [v, 1])].sort((a, b) => a[0] - b[0]);
-  const ranks = new Array(all.length);
-  let tieSum = 0;
-  for (let i = 0; i < all.length;) {
-    let j = i;
-    while (j + 1 < all.length && all[j + 1][0] === all[i][0]) j++;
-    const r = (i + j + 2) / 2;
-    for (let k = i; k <= j; k++) ranks[k] = r;
-    const t = j - i + 1;
-    tieSum += t ** 3 - t;
-    i = j + 1;
-  }
-  let r1 = 0;
-  all.forEach((e, i) => { if (e[1] === 0) r1 += ranks[i]; });
-  const U1 = r1 - (n1 * (n1 + 1)) / 2;
-  const U = Math.min(U1, n1 * n2 - U1);
-  const N = n1 + n2;
-  const mu = (n1 * n2) / 2;
-  const sigma = Math.sqrt(((n1 * n2) / 12) * (N + 1 - tieSum / (N * (N - 1))));
-  if (sigma === 0) return { U, z: 0, p: 1, r: 0 };
-  const z = (Math.abs(U - mu) - 0.5) / sigma;
-  const p = Math.min(1, 2 * (1 - normCdf(z)));
-  return { U, z, p, r: z / Math.sqrt(N) };
-}
-
-const fmt = (v, d) => (v == null || !isFinite(v) ? '—' : v.toFixed(d).replace('.', ','));
-const fmtP = (p) => (p == null ? '—' : p < 0.001 ? '< 0,001' : p.toFixed(3).replace('.', ','));
+import { quantile, mannWhitney, fmt, fmtP } from './stats.mjs';
+import { extraSections, runsCsv } from './extra.mjs';
 
 // ---------- завантаження ----------
 async function inputs() {
@@ -102,12 +60,15 @@ async function main() {
       if (!line.trim()) continue;
       const r = JSON.parse(line);
       if (r.error) { errors++; continue; }
+      r.layout ??= 'feed';      // дані тези 3 — без цих полів
+      r.scenario ??= 'steady';
       rows.push(r);
     }
   }
-  const groups = new Map(); // "net|dev" → cfg → metric → values[]
+  const groups = new Map(); // "layout|scenario|net|dev" → cfg → metric → values[]
   for (const r of rows) {
-    const g = `${r.network}|${r.device}`;
+    if (!CFG_ORDER.includes(r.config)) continue; // абляції — в окремому розділі
+    const g = `${r.layout}|${r.scenario}|${r.network}|${r.device}`;
     if (!groups.has(g)) groups.set(g, new Map());
     const byCfg = groups.get(g);
     if (!byCfg.has(r.config)) byCfg.set(r.config, Object.fromEntries(METRICS.map((m) => [m.key, []])));
@@ -122,15 +83,16 @@ async function main() {
     `Джерела: ${files.map((f) => path.relative(ROOT, f)).join(', ')}. Успішних прогонів: ${rows.length}${errors ? `, з помилкою: ${errors}` : ''}.`,
     `Порівняння: ${CFG_LABEL[TEST] ?? TEST} відносно ${BASES.map((b) => CFG_LABEL[b] ?? b).join(' і ')} (якщо є в даних); U-критерій Манна — Уїтні, двосторонній, α = ${String(ALPHA).replace('.', ',')}.`,
     `Chrome: ${[...new Set(rows.map((r) => r.chrome))].join(', ')}\n`];
-  const csv = ['network,device,metric,config,n,median,p75,change_pct_vs_base,mw_U,mw_p'];
+  const csv = ['layout,scenario,network,device,metric,config,n,median,p75,change_pct_vs_base,mw_U,mw_p'];
 
   for (const [g, byCfg] of [...groups.entries()].sort()) {
-    const [net, dev] = g.split('|');
+    const [layout, scenario, net, dev] = g.split('|');
+    const where = `${layout === 'feed' ? '' : layout + ' · '}${scenario === 'steady' ? '' : scenario + ' · '}`;
     const cfgs = CFG_ORDER.filter((c) => byCfg.has(c)).concat([...byCfg.keys()].filter((c) => !CFG_ORDER.includes(c)));
     const bases = BASES.filter((b) => byCfg.has(b) && b !== TEST);
     const n = Object.fromEntries(cfgs.map((c) => [c, byCfg.get(c)._n]));
-    md.push(`## ${net} · ${dev}\n`);
-    md.push(`Таблиця — Показники продуктивності тестового застосунку (${net}, ${dev}, медіана; у дужках — 75-й процентиль). Прогонів: ${cfgs.map((c) => `${short(c)} = ${n[c]}`).join(', ')}.\n`);
+    md.push(`## ${where}${net} · ${dev}\n`);
+    md.push(`Таблиця — Показники продуктивності тестового застосунку (${where}${net}, ${dev}, медіана; у дужках — 75-й процентиль). Прогонів: ${cfgs.map((c) => `${short(c)} = ${n[c]}`).join(', ')}.\n`);
     const cmpHead = bases.map((b) => `Зміна ${short(TEST)} відносно ${short(b)}, % | p (${short(b)})`).join(' | ');
     md.push(`| Показник | ${cfgs.map((c) => CFG_LABEL[c] ?? c).join(' | ')}${bases.length ? ' | ' + cmpHead : ''} |`);
     md.push(`|${'---|'.repeat(cfgs.length + 1 + bases.length * 2)}`);
@@ -142,7 +104,7 @@ async function main() {
         med[c] = quantile(vals, 0.5);
         const p75 = quantile(vals, 0.75);
         cells.push(vals.length ? `${fmt(med[c], m.d)} (${fmt(p75, m.d)})` : '—');
-        csv.push([net, dev, m.key, c, vals.length, med[c] ?? '', p75 ?? ''].join(',') + ',,,');
+        csv.push([layout, scenario, net, dev, m.key, c, vals.length, med[c] ?? '', p75 ?? ''].join(',') + ',,,');
       }
       if (cells.every((c) => c === '—')) continue;
       const y = byCfg.get(TEST)?.[m.key] ?? [];
@@ -152,7 +114,7 @@ async function main() {
         const mw = mannWhitney(x, y);
         const sig = mw && mw.p < ALPHA ? ' *' : '';
         cells.push(change == null ? '—' : (change > 0 ? '+' : '') + fmt(change, 1), `${fmtP(mw?.p)}${sig}`);
-        csv.push([net, dev, m.key, `${TEST}_vs_${b}`, '', '', '', change ?? '', mw?.U ?? '', mw?.p ?? ''].join(','));
+        csv.push([layout, scenario, net, dev, m.key, `${TEST}_vs_${b}`, '', '', '', change ?? '', mw?.U ?? '', mw?.p ?? ''].join(','));
       }
       md.push(`| ${m.label} | ${cells.join(' | ')} |`);
     }
@@ -162,6 +124,8 @@ async function main() {
     md.push('');
     md.push(`\\* — різниця статистично значуща (p < ${String(ALPHA).replace('.', ',')}).\n`);
   }
+
+  md.push(...extraSections(rows, { label: CFG_LABEL, short }));
 
   md.push(`## Примітки до методики вимірювань\n`,
     `- LCP фіксується до першої взаємодії (прокручування). Якщо головне зображення не встигло відобразитися, LCP-елементом стає текст і LCP виглядає «кращим» — дивіться рядки «Головне зображення відобразилось» і «LCP-елемент».`,
@@ -174,8 +138,9 @@ async function main() {
   await fs.mkdir(RES, { recursive: true });
   await fs.writeFile(path.join(RES, 'summary.md'), md.join('\n'));
   await fs.writeFile(path.join(RES, 'summary.csv'), csv.join('\n'));
+  await fs.writeFile(path.join(RES, 'runs.csv'), runsCsv(rows));
   console.log(md.join('\n'));
-  console.log(`\n→ results/summary.md, results/summary.csv`);
+  console.log(`\n→ results/summary.md, results/summary.csv, results/runs.csv (по рядку на прогін — для графіків)`);
 }
 
 main().catch((e) => { console.error(e.message); process.exit(1); });

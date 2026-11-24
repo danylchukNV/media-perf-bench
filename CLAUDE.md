@@ -32,8 +32,8 @@ ID папки в Drive: `1rXsQJMqLM4qw4_UIwJvO-gsw_P3_AKQX`. Оформленн�
 
 Детально — у `README.md`.
 - `src/akpm/*.ts` — бібліотека методу. Модулі відповідають компонентам з тези 2: context (1), priority (2), quality (3), index (4–5: планувальник, рендеринг), video, feedback (6).
-- `scripts/generate-media.mjs` — медіа та `manifest.json`; `scripts/build-pages.mjs` — сторінки `/a`, `/b`, `/b2`, `/c`.
-- `bench/run.mjs` — раннер Puppeteer; `bench/probe.js` — вимірювальний зонд; `bench/analyze.mjs` — статистика (медіана, p75, U-критерій Манна — Уїтні).
+- `scripts/generate-media.mjs` — медіа та `manifest.json`; `scripts/build-pages.mjs` — сторінки `/a`, `/b`, `/b2`, `/c`, а також `/c2` (В2), `/c-no-*` (абляції) і макети `/gallery/*`, `/infinite/*`, `/video/*`.
+- `bench/run.mjs` — раннер Puppeteer (пресети `--plan`, сценарії, траси мережі); `bench/probe.js` — вимірювальний зонд; `bench/analyze.mjs` — статистика (медіана, p75, U-критерій Манна — Уїтні); `bench/extra.mjs` — розділи розширеного експерименту; `bench/stats.mjs` — статистичні функції.
 - Усі параметри експерименту — у `bench.config.mjs`.
 
 Команди: `npm run media`, `npm run build`, `npm run serve`, `npm run bench -- --runs 3 --networks slow4g --devices mobile`, `npm run analyze`, `npm run typecheck`.
@@ -50,6 +50,8 @@ ID папки в Drive: `1rXsQJMqLM4qw4_UIwJvO-gsw_P3_AKQX`. Оформленн�
 - LCP у А часто дорівнює тексту, бо банер не встигає відобразитися. Тому в аналізі є окремі рядки: «Час відображення головного зображення» (Element Timing, `elementtiming="hero"`) і «LCP-елемент — зображення».
 - `content-visibility` у В вимкнено за замовчуванням (прапорець `--cv` у build-pages), бо може впливати на CLS.
 - TBT рахується за всю сесію, включно з прокручуванням. Це не те саме, що TBT у Lighthouse, і в тезі це треба оговорити.
+
+- Розширений експеримент (24.11.2026): ядро — факторний 2×2, абляція В, версія В2, сценарії поведінки, змінна мережа, макети gallery/infinite/video. Параметри В2 — у `bench.config.mjs` → `akpm.v2`; без них бібліотека поводиться як В. Розмітка стрічки `/a /b /b2 /c` має лишатися побайтово такою, як у тезі 3.
 
 ## Правила роботи
 

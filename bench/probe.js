@@ -2,7 +2,7 @@
 // (разом із web-vitals.iife.js), тому сторінки А/Б/В залишаються «чистими».
 (() => {
   const m = (window.__bench = {
-    lcp: null, lcpEl: null, fcp: null, ttfb: null, cls: 0, inp: null, hero: null,
+    lcp: null, lcpEl: null, fcp: null, ttfb: null, cls: 0, inp: null, hero: null, heroUrl: null,
     longTasks: [], videos: {},
   });
 
@@ -22,7 +22,7 @@
   // Час відображення головного зображення (атрибут elementtiming="hero" на банері в усіх конфігураціях)
   try {
     new PerformanceObserver((l) => {
-      for (const e of l.getEntries()) if (e.identifier === 'hero') m.hero = e.renderTime || e.loadTime;
+      for (const e of l.getEntries()) if (e.identifier === 'hero') { m.hero = e.renderTime || e.loadTime; m.heroUrl = e.url || null; }
     }).observe({ type: 'element', buffered: true });
   } catch {}
 
@@ -74,7 +74,7 @@
     ttp.sort((a, b) => a - b);
     const med = ttp.length ? ttp[Math.floor((ttp.length - 1) / 2)] : null;
     return {
-      lcp: m.lcp, lcpEl: m.lcpEl, hero: m.hero, fcp: m.fcp, ttfb: m.ttfb, cls: m.cls, inp: m.inp, tbt,
+      lcp: m.lcp, lcpEl: m.lcpEl, hero: m.hero, heroUrl: m.heroUrl, fcp: m.fcp, ttfb: m.ttfb, cls: m.cls, inp: m.inp, tbt,
       videoTtp: med, videosPlayed: ttp.length, videoStalls: stalls,
       akpm: window.AKPM_STATS ? { ...window.AKPM_STATS } : null,
     };

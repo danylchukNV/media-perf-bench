@@ -13,7 +13,7 @@ import { computePriority, DEFAULT_WEIGHTS } from './priority';
 import { chooseVariant, detectFormats, extFor, idealBytes } from './quality';
 import { Feedback } from './feedback';
 import { ManagedVideo } from './video';
-import type { Geometry, ImageEntry, ImageFormat, Options, PriorityResult, Weights } from './types';
+import type { Component, Geometry, ImageEntry, ImageFormat, Options, PriorityResult, Weights } from './types';
 
 type ImgState = 'idle' | 'loading' | 'loaded';
 
@@ -32,6 +32,8 @@ interface ManagedImage {
   /** не перезапускати до цього моменту (після скасування) */
   cooldownUntil: number;
   last?: PriorityResult;
+  /** В2: хоч раз відкладене через бюджет попереднього завантаження */
+  deferred?: boolean;
 }
 
 export interface Stats {
@@ -47,13 +49,24 @@ export interface Stats {
   horizonMs: number;
   format: ImageFormat;
   maxConcurrent: number;
+  /** мітка варіанта методу та вимкнені компоненти (абляція) */
+  variant: string;
+  disabled: Component[];
+  /** В2: скільки елементів хоч раз відкладено через бюджет попереднього завантаження */
+  prefetchSkips: number;
+  /** В2: скільки стрибків прокручування розпізнано */
+  jumps: number;
 }
 
 class Engine {
   private readonly opts: Required<Omit<Options, 'weights' | 'maxConcurrent'>> & { maxConcurrent?: number };
   private readonly weights: Weights;
   private readonly net: NetworkEstimator;
-  private readonly scroll = new ScrollTracker();
+  private readonly scroll: ScrollTracker;
+  private readonly off: Record<Component, boolean>;
+  /** В2: «маркерне відро» байтів для попереднього завантаження невидимих елементів */
+  private tokens = 0;
+  private lastRefill = performance.now();
   private readonly fb: Feedback;
   private dev: DeviceInfo = readDevice();
   private format: ImageFormat = 'jpeg';
@@ -75,16 +88,30 @@ class Engine {
       persist: true,
       tickMs: 100,
       debug: false,
+      disable: [],
+      // значення за замовчуванням = поведінка версії В (теза 3)
+      prefetchShare: 0,
+      prefetchT: 0.05,
+      prefetchDistVh: 1.5,
+      jumpGuard: false,
+      throughput: 'ewma',
+      heroGateStrict: false,
+      upgradeMinGain: 1,
+      variant: 'c',
       ...options,
     } as Engine['opts'];
+    const dis = new Set(this.opts.disable);
+    this.off = { prediction: dis.has('prediction'), quality: dis.has('quality'), abort: dis.has('abort'), feedback: dis.has('feedback') };
     this.weights = { ...DEFAULT_WEIGHTS, ...options.weights };
-    const stored = this.opts.persist ? Feedback.load() : null;
-    this.net = new NetworkEstimator(stored ?? undefined);
-    this.fb = new Feedback(stored?.horizonMs ?? this.opts.horizonMs, this.opts.persist);
+    this.scroll = new ScrollTracker(this.opts.jumpGuard);
+    const stored = this.opts.persist && !this.off.feedback ? Feedback.load() : null;
+    this.net = new NetworkEstimator(stored ?? undefined, this.opts.throughput);
+    this.fb = new Feedback(stored?.horizonMs ?? this.opts.horizonMs, this.opts.persist && !this.off.feedback, !this.off.feedback);
     this.stats = {
       loads: 0, upgrades: 0, aborts: 0, misses: 0, wastes: 0, bytes: 0,
       bps: this.net.bps, kbps: this.net.kbps, rttMs: this.net.rttMs,
       horizonMs: this.fb.horizonMs, format: 'jpeg', maxConcurrent: 0,
+      variant: this.opts.variant, disabled: [...dis], prefetchSkips: 0, jumps: 0,
     };
   }
 
@@ -180,8 +207,10 @@ class Engine {
     const { vh, dpr } = this.dev;
     const dprEff = Math.min(dpr, this.opts.dprCap);
     const sy = this.scroll.y;
-    const v = this.scroll.v;
+    // Абляція «без прогнозу»: швидкість 0 → для невидимих T = 0, τ = ∞ (лишається тільки відстань V)
+    const v = this.off.prediction ? 0 : this.scroll.v;
     const horizon = this.fb.horizonMs;
+    this.refillTokens(horizon);
 
     // Відео: свій життєвий цикл, але займають слоти мережі
     let videoBusy = 0;
@@ -195,7 +224,7 @@ class Engine {
       if (vid.busy && p.dist < vh) videoBusy++;
     }
 
-    const queue: { it: ManagedImage; p: PriorityResult; upgrade: boolean }[] = [];
+    const queue: { it: ManagedImage; p: PriorityResult; upgrade: boolean; bytes: number }[] = [];
     for (const it of this.images) {
       const cssW = it.geom.bottom > it.geom.top ? it.el.clientWidth || this.dev.vw : this.dev.vw;
       const bytes = idealBytes(it.entry, this.format, cssW, dprEff);
@@ -214,7 +243,7 @@ class Engine {
         // Скасовуємо запити до елементів, що вийшли із зони інтересу.
         // Межа скасування (2,5 екрана) далі за межу запуску (1,5 екрана) — гістерезис проти «скасував → запустив».
         const leaving = !p.visible && p.dist > 2.5 * vh && p.T < 0.05;
-        if (leaving && it.ctrl) {
+        if (leaving && it.ctrl && !this.off.abort) {
           it.ctrl.abort();
           it.cooldownUntil = performance.now() + 1000;
           this.stats.aborts++;
@@ -223,10 +252,11 @@ class Engine {
         continue;
       }
       if (it.state === 'idle') {
-        const eligible = (p.visible || p.T > 0.05 || p.dist < 1.5 * vh) && performance.now() >= it.cooldownUntil;
-        if (eligible) queue.push({ it, p, upgrade: false });
+        const eligible = (p.visible || p.T > this.opts.prefetchT || p.dist < this.opts.prefetchDistVh * vh)
+          && performance.now() >= it.cooldownUntil;
+        if (eligible) queue.push({ it, p, upgrade: false, bytes });
       } else if (it.state === 'loaded' && it.degraded && p.visible && !this.dev.saveData) {
-        queue.push({ it, p: { ...p, P: p.P - 1 }, upgrade: true }); // покращення якості — найнижчий пріоритет
+        queue.push({ it, p: { ...p, P: p.P - 1 }, upgrade: true, bytes }); // покращення якості — найнижчий пріоритет
       }
     }
 
@@ -235,6 +265,7 @@ class Engine {
     let limit = this.maxConcurrent() - videoBusy;
     if (gate) limit = Math.min(limit, 1);
     limit = Math.max(1, limit);
+    if (gate && this.opts.heroGateStrict) limit = 0; // В2: канал повністю віддано головному зображенню
     this.stats.maxConcurrent = limit;
 
     for (const q of queue) {
@@ -242,6 +273,11 @@ class Engine {
       if (gate && !q.p.visible) break;            // поки головне зображення не готове — тільки видиме
       if (q.upgrade && this.active > 0) break;    // покращення — лише коли мережа вільна
       if (q.upgrade && queue.some((x) => !x.upgrade)) break;
+      // В2: попереднє завантаження невидимих — у межах бюджету байтів
+      if (!q.p.visible && !q.upgrade && !this.spendTokens(q.bytes)) {
+        if (!q.it.deferred) { q.it.deferred = true; this.stats.prefetchSkips++; }
+        continue;
+      }
       void this.load(q.it, q.p, cssWidth(q.it, this.dev.vw), dprEff, q.upgrade);
     }
 
@@ -251,6 +287,30 @@ class Engine {
     this.stats.horizonMs = Math.round(this.fb.horizonMs);
     this.stats.misses = this.fb.misses;
     this.stats.wastes = this.fb.wastes;
+    this.stats.jumps = this.scroll.jumps;
+  }
+
+  /** В2: поповнення бюджету попереднього завантаження зі швидкістю prefetchShare × B */
+  private refillTokens(horizonMs: number): void {
+    const now = performance.now();
+    const dt = (now - this.lastRefill) / 1000;
+    this.lastRefill = now;
+    if (!(this.opts.prefetchShare > 0)) return;
+    const rate = this.opts.prefetchShare * this.net.bps;
+    this.tokens = Math.min(this.tokenCap(horizonMs), this.tokens + rate * dt);
+  }
+
+  private tokenCap(horizonMs: number): number {
+    // ємність — стільки, скільки виділена частка каналу передає за горизонт прогнозу (не менше 64 КБ)
+    return Math.max(64_000, this.opts.prefetchShare * this.net.bps * (horizonMs / 1000));
+  }
+
+  private spendTokens(bytes: number): boolean {
+    if (!(this.opts.prefetchShare > 0)) return true;
+    // повне відро пропускає і ресурс, більший за ємність, — інакше великий файл не завантажився б ніколи
+    if (this.tokens < bytes && this.tokens < this.tokenCap(this.fb.horizonMs) * 0.99) return false;
+    this.tokens = Math.max(0, this.tokens - bytes);
+    return true;
   }
 
   private async load(it: ManagedImage, p: PriorityResult, cssW: number, dpr: number, upgrade: boolean): Promise<void> {
@@ -261,8 +321,13 @@ class Engine {
     else if (isFinite(p.tauMs)) budget = Math.min(10_000, Math.max(300, p.tauMs * 0.8));
     else budget = this.opts.visibleBudgetMs * 2; // користувач стоїть: є час, але не нескінченний
 
+    // Абляція «без вибору якості»: нескінченний бюджет → завжди ідеальна для екрана роздільність
+    if (this.off.quality) budget = Infinity;
     const choice = chooseVariant(it.entry, this.format, cssW, dpr, budget, this.net.bps / Math.max(1, this.active + 1), this.net.rttMs);
-    if (upgrade && choice.width <= it.loadedWidth) { it.degraded = false; return; }
+    if (upgrade && (choice.width <= it.loadedWidth || choice.width < it.loadedWidth * this.opts.upgradeMinGain)) {
+      it.degraded = false;
+      return;
+    }
 
     const url = `${this.opts.baseUrl}/media/img/${it.id}/${choice.width}.${extFor(this.format)}`;
     const ctrl = new AbortController();
@@ -282,7 +347,8 @@ class Engine {
       if (!res.ok) throw new Error(String(res.status));
       const blob = await res.blob();
       const tEnd = performance.now();
-      this.net.addSample(blob.size, tEnd - tHead, Math.max(concurrencyAtStart, this.active));
+      if (this.opts.throughput === 'aggregate') this.net.addTransfer(blob.size, tHead, tEnd);
+      else this.net.addSample(blob.size, tEnd - tHead, Math.max(concurrencyAtStart, this.active));
       this.stats.bytes += blob.size;
 
       const objectUrl = URL.createObjectURL(blob);

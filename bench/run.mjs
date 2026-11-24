@@ -1,10 +1,13 @@
-// Раннер експерименту: для кожної комбінації «конфігурація × мережа × пристрій» виконує N прогонів
-// сценарію (завантаження → пауза → прокручування з фіксованою швидкістю + кліки) і зберігає метрики.
+// Раннер експерименту: для кожної комбінації «конфігурація × макет × сценарій × мережа × пристрій»
+// виконує N прогонів сценарію (завантаження → пауза → фази прокручування + кліки) і зберігає метрики.
 //
 // Приклади:
-//   node bench/run.mjs                                   # усе з bench.config.mjs
+//   node bench/run.mjs                                   # усе з bench.config.mjs (стрічка, сценарій тези 3)
 //   node bench/run.mjs --runs 5 --networks slow4g --devices mobile
 //   node bench/run.mjs --configs b,c --runs 30
+//   node bench/run.mjs --plan factorial                  # пресет із bench.config.mjs → bench.plans
+//   node bench/run.mjs --plan layouts --runs 3           # пресет, але 3 прогони
+//   node bench/run.mjs --layouts gallery,video --scenarios steady,jump --configs b2,c2
 // Chrome: за замовчуванням той, що завантажив Puppeteer; інший — через PUPPETEER_EXECUTABLE_PATH.
 
 import fs from 'node:fs/promises';
@@ -23,16 +26,42 @@ function arg(name, def) {
 }
 const list = (v, def) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : def);
 
-const runs = Number(arg('runs', B.runs));
-const configs = list(arg('configs'), B.configs);
-const networks = list(arg('networks'), Object.keys(B.networks));
-const devices = list(arg('devices'), Object.keys(B.devices));
-const outDir = path.resolve(ROOT, arg('out', 'results'));
+const planName = arg('plan');
+const plan = planName ? B.plans?.[planName] : {};
+if (!plan) throw new Error(`Немає пресету «${planName}». Є: ${Object.keys(B.plans ?? {}).join(', ')}`);
+
 const sc = B.scenario;
+// Сценарій тези 3 — з параметрів scenario; решта — з bench.scenarios
+const SCENARIOS = {
+  steady: { phases: [{ scroll: sc.scrollDistancePx, speed: sc.scrollSpeedPxPerSec, pauseEveryPx: sc.pauseEveryPx, pauseMs: sc.pauseMs }] },
+  ...B.scenarios,
+};
+const LAYOUTS = ['feed', ...Object.keys(config.layouts ?? {})];
+
+const runs = Number(arg('runs', plan.runs ?? B.runs));
+const configs = list(arg('configs'), plan.configs ?? B.configs);
+const layouts = list(arg('layouts'), plan.layouts ?? ['feed']);
+const scenarios = list(arg('scenarios'), plan.scenarios ?? ['steady']);
+const staticNets = Object.keys(B.networks).filter((n) => !B.networks[n].trace);
+const cliNets = list(arg('networks'));
+const cliDevs = list(arg('devices'));
+// combos — явні пари «мережа, пристрій» (як у тезі 3); інакше — усі поєднання
+const combos = !cliNets && !cliDevs && plan.combos
+  ? plan.combos
+  : (cliNets ?? plan.networks ?? staticNets).flatMap((n) => (cliDevs ?? plan.devices ?? Object.keys(B.devices)).map((d) => [n, d]));
+const outDir = path.resolve(ROOT, arg('out', 'results'));
 const maxLoadWaitMs = Number(arg('max-load-wait', 20000));
 
+for (const l of layouts) if (!LAYOUTS.includes(l)) throw new Error(`Невідомий макет «${l}». Є: ${LAYOUTS.join(', ')}`);
+for (const s of scenarios) if (!SCENARIOS[s]) throw new Error(`Невідомий сценарій «${s}». Є: ${Object.keys(SCENARIOS).join(', ')}`);
+for (const [n, d] of combos) {
+  if (!B.networks[n]) throw new Error(`Невідома мережа «${n}»`);
+  if (!B.devices[d]) throw new Error(`Невідомий пристрій «${d}»`);
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const MAX_STEP_PX = 200; // ≈ 4 номінальні кроки по 50 мс при 900 пікс./с
+// Крок обмежено ≈ 4 номінальними кроками по 50 мс при 900 пікс./с; для швидших сценаріїв — пропорційно
+const maxStep = (speed) => Math.max(200, Math.round(Math.abs(speed) * 0.1));
 
 // Детерміноване перемішування порядку конфігурацій у кожному раунді (зменшує систематичний зсув)
 function shuffled(arr, seed) {
@@ -46,40 +75,54 @@ function shuffled(arr, seed) {
   return a;
 }
 
-async function measure(browser, baseUrl, cfg, netName, devName) {
+async function measure(browser, baseUrl, job) {
   const ctx = await browser.createBrowserContext();
   // Контекст закривається і при помилці: інакше сторінка вантажила б медіа далі й заважала наступному прогону
+  const timers = [];
   try {
-    return await measureIn(ctx, baseUrl, cfg, netName, devName);
+    return await measureIn(ctx, baseUrl, job, timers);
   } finally {
+    timers.forEach(clearTimeout);
     await ctx.close().catch(() => {});
   }
 }
 
-async function measureIn(ctx, baseUrl, cfg, netName, devName) {
+const netConditions = (n, netName) => ({
+  offline: false,
+  latency: n.latency,
+  downloadThroughput: (n.downloadKbps * 1000) / 8,
+  uploadThroughput: (n.uploadKbps * 1000) / 8,
+  connectionType: netName === '3g' ? 'cellular3g' : 'cellular4g',
+});
+
+async function measureIn(ctx, baseUrl, { cfg, layout, scenario, network: netName, device: devName }, timers) {
   const net = B.networks[netName];
   const dev = B.devices[devName];
+  const scen = SCENARIOS[scenario];
+  const dwellMs = scen.videoDwellMs ?? sc.videoDwellMs;
   const page = await ctx.newPage();
   const cdp = await page.createCDPSession();
 
   // ---- облік трафіку через DevTools Protocol (враховує і скасовані запити) ----
+  // Часові мітки (с, монотонний час DevTools) — для діагностики конкуренції за канал під час завантаження банера
   const reqs = new Map();
+  const chunks = []; // [час, requestId, байти]
   cdp.on('Network.requestWillBeSent', (e) => {
     if (/^(data|blob):/.test(e.request.url)) return;
-    if (!reqs.has(e.requestId)) reqs.set(e.requestId, { partial: 0, final: null, url: e.request.url });
+    if (!reqs.has(e.requestId)) reqs.set(e.requestId, { partial: 0, final: null, url: e.request.url, start: e.timestamp, end: null });
   });
-  cdp.on('Network.dataReceived', (e) => { const r = reqs.get(e.requestId); if (r) r.partial += e.encodedDataLength; });
-  cdp.on('Network.loadingFinished', (e) => { const r = reqs.get(e.requestId); if (r) r.final = e.encodedDataLength; });
+  cdp.on('Network.dataReceived', (e) => {
+    const r = reqs.get(e.requestId);
+    if (r) { r.partial += e.encodedDataLength; chunks.push([e.timestamp, e.requestId, e.encodedDataLength]); }
+  });
+  cdp.on('Network.loadingFinished', (e) => { const r = reqs.get(e.requestId); if (r) { r.final = e.encodedDataLength; r.end = e.timestamp; } });
+  cdp.on('Network.loadingFailed', (e) => { const r = reqs.get(e.requestId); if (r) r.end = e.timestamp; });
 
   await cdp.send('Network.enable');
   await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
-  await cdp.send('Network.emulateNetworkConditions', {
-    offline: false,
-    latency: net.latency,
-    downloadThroughput: (net.downloadKbps * 1000) / 8,
-    uploadThroughput: (net.uploadKbps * 1000) / 8,
-    connectionType: netName === '3g' ? 'cellular3g' : 'cellular4g',
-  });
+  // Змінна мережа: перший крок траси — одразу, наступні — за таймерами від початку навігації
+  const trace = net.trace ?? [{ atMs: 0, ...net }];
+  await cdp.send('Network.emulateNetworkConditions', netConditions(trace[0], netName));
   await cdp.send('Emulation.setCPUThrottlingRate', { rate: dev.cpuSlowdown });
   await page.setViewport({
     width: dev.width, height: dev.height, deviceScaleFactor: dev.deviceScaleFactor,
@@ -91,60 +134,80 @@ async function measureIn(ctx, baseUrl, cfg, netName, devName) {
   await page.evaluateOnNewDocument(wvSrc + '\n;' + probeSrc);
 
   const t0 = Date.now();
+  for (const step of trace.slice(1)) {
+    timers.push(setTimeout(() => { cdp.send('Network.emulateNetworkConditions', netConditions(step, netName)).catch(() => {}); }, step.atMs));
+  }
   const loaded = page.waitForNavigation({ waitUntil: 'load', timeout: 0 }).catch(() => {});
-  await page.goto(`${baseUrl}/${cfg}`, { waitUntil: 'domcontentloaded', timeout: sc.navigationTimeoutMs });
+  const urlPath = layout === 'feed' ? `/${cfg}` : `/${layout}/${cfg}`;
+  await page.goto(`${baseUrl}${urlPath}`, { waitUntil: 'domcontentloaded', timeout: sc.navigationTimeoutMs });
   await Promise.race([loaded, sleep(maxLoadWaitMs)]);
   const loadMs = Date.now() - t0;
   await sleep(sc.settleAfterLoadMs);
 
-  // ---- сценарій: прокручування з фіксованою швидкістю, паузи «читання», кліки «лайк» ----
+  // ---- сценарій: фази прокручування, паузи «читання», стрибки, очікування, кліки «лайк» ----
   await page.mouse.move(dev.width / 2, dev.height / 2);
-  let scrolled = 0;
-  let nextPause = sc.pauseEveryPx;
-  const clickAt = Array.from({ length: sc.clicks }, (_, i) => Math.round((sc.scrollDistancePx * (i + 1)) / (sc.clicks + 1)));
-  let last = Date.now();
-  while (scrolled < sc.scrollDistancePx) {
-    await sleep(50);
-    const now = Date.now();
-    // Крок обмежено: якщо ітерація зависла (сторінка зайнята), прокручування сповільнюється,
-    // а не перестрибує через контент — інакше відео могло б не потрапити у вікно взагалі
-    const dy = Math.min(MAX_STEP_PX, Math.max(1, Math.round((sc.scrollSpeedPxPerSec * (now - last)) / 1000)));
-    last = now;
-    await page.mouse.wheel({ deltaY: dy });
-    scrolled += dy;
-    if (clickAt.length && scrolled >= clickAt[0]) {
-      clickAt.shift();
-      const pt = await page.evaluate(() => {
-        for (const b of document.querySelectorAll('.like')) {
-          const r = b.getBoundingClientRect();
-          if (r.top > 60 && r.bottom < innerHeight - 10) return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-        }
-        return null;
-      });
-      if (pt) { await page.mouse.click(pt.x, pt.y); await page.mouse.move(dev.width / 2, dev.height / 2); }
-      last = Date.now();
+  // Кліки рівномірно за сумарною відстанню прокручування всіх фаз (для «steady» — як у тезі 3)
+  const totalScroll = scen.phases.reduce((a, ph) => a + Math.abs(ph.scroll ?? 0), 0);
+  const clickAt = Array.from({ length: sc.clicks }, (_, i) => Math.round((totalScroll * (i + 1)) / (sc.clicks + 1)));
+  let scrolledTotal = 0;
+  for (const ph of scen.phases) {
+    if (ph.wait) { await sleep(ph.wait); continue; }
+    if (ph.jumpTo != null) {
+      await page.evaluate((f) => window.scrollTo({ top: Math.round(f * (document.documentElement.scrollHeight - innerHeight)), behavior: 'instant' }), ph.jumpTo);
+      continue;
     }
-    if (scrolled >= nextPause) {
-      nextPause += sc.pauseEveryPx;
-      await sleep(sc.pauseMs);
-      last = Date.now();
+    const sign = Math.sign(ph.scroll);
+    const dist = Math.abs(ph.scroll);
+    const speed = ph.speed ?? sc.scrollSpeedPxPerSec;
+    let scrolled = 0;
+    let nextPause = ph.pauseEveryPx ?? Infinity;
+    let last = Date.now();
+    while (scrolled < dist) {
+      await sleep(50);
+      const now = Date.now();
+      // Крок обмежено: якщо ітерація зависла (сторінка зайнята), прокручування сповільнюється,
+      // а не перестрибує через контент — інакше відео могло б не потрапити у вікно взагалі
+      const dy = Math.min(maxStep(speed), Math.max(1, Math.round((speed * (now - last)) / 1000)));
+      last = now;
+      await page.mouse.wheel({ deltaY: sign * dy });
+      scrolled += dy;
+      scrolledTotal += dy;
+      if (clickAt.length && scrolledTotal >= clickAt[0]) {
+        clickAt.shift();
+        const pt = await page.evaluate(() => {
+          for (const b of document.querySelectorAll('.like')) {
+            const r = b.getBoundingClientRect();
+            if (r.top > 60 && r.bottom < innerHeight - 10) return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          }
+          return null;
+        });
+        if (pt) { await page.mouse.click(pt.x, pt.y); await page.mouse.move(dev.width / 2, dev.height / 2); }
+        last = Date.now();
+      }
+      if (scrolled >= nextPause) {
+        nextPause += ph.pauseEveryPx;
+        await sleep(ph.pauseMs ?? sc.pauseMs);
+        last = Date.now();
+      }
+      const st = await page.evaluate((up) => {
+        // Нескінченна стрічка: кінець — лише коли довантажувати вже нічого (маркер #sentinel прибрано)
+        const atEnd = up ? scrollY <= 0
+          : innerHeight + scrollY >= document.documentElement.scrollHeight - 2 && !document.getElementById('sentinel');
+        let video = -1;
+        document.querySelectorAll('video').forEach((v, i) => {
+          if (video >= 0 || v.__dwelled) return;
+          const r = v.getBoundingClientRect();
+          const vis = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) / (r.height || 1);
+          if (vis >= 0.6) { v.__dwelled = true; video = i; }
+        });
+        return { atEnd, video };
+      }, sign < 0);
+      if (st.video >= 0 && dwellMs) {
+        await sleep(dwellMs);
+        last = Date.now();
+      }
+      if (st.atEnd) break;
     }
-    const st = await page.evaluate(() => {
-      const atEnd = innerHeight + scrollY >= document.documentElement.scrollHeight - 2;
-      let video = -1;
-      document.querySelectorAll('video').forEach((v, i) => {
-        if (video >= 0 || v.__dwelled) return;
-        const r = v.getBoundingClientRect();
-        const vis = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)) / (r.height || 1);
-        if (vis >= 0.6) { v.__dwelled = true; video = i; }
-      });
-      return { atEnd, video };
-    });
-    if (st.video >= 0 && sc.videoDwellMs) {
-      await sleep(sc.videoDwellMs);
-      last = Date.now();
-    }
-    if (st.atEnd) break;
   }
   await sleep(sc.finalWaitMs);
 
@@ -153,10 +216,35 @@ async function measureIn(ctx, baseUrl, cfg, netName, devName) {
   for (const r of reqs.values()) bytes += r.final ?? r.partial;
   return {
     ...m,
+    ...heroDiagnostics(reqs, chunks, m.heroUrl),
     bytes,
     requests: reqs.size,
     loadMs,
     sessionMs: Date.now() - t0,
+  };
+}
+
+/**
+ * Діагностика нестабільного LCP: що ще йшло каналом, поки завантажувалося головне зображення.
+ * heroReqStart/heroReqEnd — мс від першого запиту (документа); heroCompetingBytes — байти інших
+ * відповідей, отримані за цей час; heroCompetingReqs — скільки інших запитів перетиналося з ним у часі.
+ */
+function heroDiagnostics(reqs, chunks, heroUrl) {
+  if (!heroUrl) return {};
+  const all = [...reqs.entries()];
+  const t0 = Math.min(...all.map(([, r]) => r.start));
+  const hero = all.find(([, r]) => r.url === heroUrl);
+  if (!hero) return {};
+  const [heroId, h] = hero;
+  const end = h.end ?? Infinity;
+  let competingBytes = 0;
+  for (const [ts, id, len] of chunks) if (id !== heroId && ts >= h.start && ts <= end) competingBytes += len;
+  const competingReqs = all.filter(([id, r]) => id !== heroId && r.start < end && (r.end ?? Infinity) > h.start).length;
+  return {
+    heroReqStart: (h.start - t0) * 1000,
+    heroReqEnd: h.end != null ? (h.end - t0) * 1000 : null,
+    heroCompetingBytes: competingBytes,
+    heroCompetingReqs: competingReqs,
   };
 }
 
@@ -192,17 +280,24 @@ async function main() {
   };
   browser = await launch();
   const chromeVersion = await browser.version();
-  console.log(`Chrome ${chromeVersion} · ${runs} прогонів × ${configs.length} конф. × ${networks.length} мереж × ${devices.length} пристр.`);
+  const total = runs * configs.length * combos.length * layouts.length * scenarios.length;
+  console.log(`Chrome ${chromeVersion}${planName ? ` · пресет «${planName}»` : ''} · ${runs} прогонів × ${configs.length} конф. × ${combos.length} (мережа, пристрій) × ${layouts.length} макет. × ${scenarios.length} сцен. = ${total} прогонів, орієнтовно ${(total * 45 / 3600).toFixed(1)} год`);
+  console.log(`  конфігурації: ${configs.join(', ')}; макети: ${layouts.join(', ')}; сценарії: ${scenarios.join(', ')}; ${combos.map((c) => c.join('×')).join(', ')}`);
 
   const MAX_ATTEMPTS = 2;
-  const total = runs * configs.length * networks.length * devices.length;
   let n = 0;
   for (let run = 1; run <= runs; run++) {
-    for (const netName of networks) {
-      for (const devName of devices) {
-        for (const cfg of shuffled(configs, run * 31 + netName.length * 7 + devName.length)) {
+    for (const [netName, devName] of combos) {
+      for (const layout of layouts) {
+       for (const scenario of scenarios) {
+        // Для серії тези 3 (стрічка, steady) зерно перемішування те саме, що й раніше
+        const seed = run * 31 + netName.length * 7 + devName.length
+          + (layout === 'feed' ? 0 : layout.length * 13) + (scenario === 'steady' ? 0 : scenario.length * 17);
+        for (const cfg of shuffled(configs, seed)) {
           n++;
-          const tag = `[${n}/${total}] ${cfg} ${netName} ${devName} #${run}`;
+          const job = { cfg, layout, scenario, network: netName, device: devName };
+          const where = `${layout === 'feed' ? '' : layout + ' '}${scenario === 'steady' ? '' : scenario + ' '}`;
+          const tag = `[${n}/${total}] ${cfg} ${where}${netName} ${devName} #${run}`;
           for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             if (!browser.connected) {
               const dead = browser;
@@ -212,8 +307,8 @@ async function main() {
             }
             const t = Date.now();
             try {
-              const m = await measure(browser, baseUrl, cfg, netName, devName);
-              const row = { config: cfg, network: netName, device: devName, run, attempt, ...m, chrome: chromeVersion };
+              const m = await measure(browser, baseUrl, job);
+              const row = { config: cfg, layout, scenario, network: netName, device: devName, run, attempt, ...m, chrome: chromeVersion };
               await fs.appendFile(jsonl, JSON.stringify(row) + '\n');
               console.log(`${tag}: LCP ${Math.round(m.lcp ?? -1)} мс, CLS ${(m.cls ?? 0).toFixed(3)}, INP ${m.inp ?? '-'} мс, ${(m.bytes / 1e6).toFixed(2)} МБ (${((Date.now() - t) / 1000).toFixed(0)} с)${attempt > 1 ? ' — повторна спроба' : ''}`);
               break;
@@ -222,11 +317,12 @@ async function main() {
                 console.error(`${tag}: ПОМИЛКА ${e.message} — повторюю`);
               } else {
                 console.error(`${tag}: ПОМИЛКА ${e.message}`);
-                await fs.appendFile(jsonl, JSON.stringify({ config: cfg, network: netName, device: devName, run, attempt, error: e.message }) + '\n');
+                await fs.appendFile(jsonl, JSON.stringify({ config: cfg, layout, scenario, network: netName, device: devName, run, attempt, error: e.message }) + '\n');
               }
             }
           }
         }
+       }
       }
     }
   }

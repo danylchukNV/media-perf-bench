@@ -18,7 +18,7 @@ export class Feedback {
   private readonly minH = 1500;
   private readonly maxH = 6000;
 
-  constructor(horizonMs: number, private readonly persist: boolean) {
+  constructor(horizonMs: number, private readonly persist: boolean, private readonly adaptive = true) {
     this.horizonMs = horizonMs;
   }
 
@@ -40,12 +40,12 @@ export class Feedback {
 
   miss(): void {
     this.misses++;
-    this.horizonMs = Math.min(this.maxH, this.horizonMs * 1.1);
+    if (this.adaptive) this.horizonMs = Math.min(this.maxH, this.horizonMs * 1.1);
   }
 
   waste(): void {
     this.wastes++;
-    this.horizonMs = Math.max(this.minH, this.horizonMs * 0.95);
+    if (this.adaptive) this.horizonMs = Math.max(this.minH, this.horizonMs * 0.95);
   }
 
   observeVitals(): void {
